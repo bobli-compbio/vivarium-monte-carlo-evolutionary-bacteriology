@@ -1,0 +1,303 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import qmc, norm
+from vivarium.core.process import Process
+from vivarium.core.composer import Composer
+from vivarium.core.engine import Engine
+
+class GenEcoliProcess(Process):
+    def ports_schema(self):
+        return {
+            'internal': {
+                'biomass': {'_default': 1.0, '_updater': 'accumulate', '_emit': True},
+                'f_plasmid': {'_default': 1, '_updater': 'set', '_emit': True},
+                'cell_state': {'_default': 100.0, '_updater': 'accumulate', '_emit': True},
+                'base_fitness': {'_default': 1.0, '_updater': 'set'} 
+            },
+            'boundary': {
+                'lethality_port': {'_default': 0.0}, 
+                'location': {'_default': [0.5, 0.5], '_emit': True}
+            }
+        }
+
+    def next_update(self, timestep, states):
+        health = states['internal']['cell_state']
+        biomass = states['internal']['biomass']
+        f_present = states['internal']['f_plasmid']
+        lhs_fitness = states['internal']['base_fitness'] 
+        amp = states['boundary']['lethality_port']
+        
+        if health <= 0:
+            return {} 
+
+        e_max = 0.05
+        ec_50 = 160.0
+        base_s_amp = (e_max * (amp**2.0)) / (ec_50**2.0 + amp**2.0)
+        
+        s_amp_noise = np.random.normal(1.0, 0.10)
+        s_amp = max(0.0, base_s_amp * s_amp_noise * (1.0 / lhs_fitness)) 
+        
+        kill_coefficient = 0.01 if f_present else 1.0
+        death_delta = -s_amp * kill_coefficient * 100.0 * timestep
+        
+        if health + death_delta <= 0:
+            return {'internal': {'biomass': -biomass, 'cell_state': -health}}
+        
+        base_mu = 0.01608 if f_present else 0.01667
+        mu_noise = np.random.normal(1.0, 0.05)
+        mu = max(0.001, base_mu * mu_noise * lhs_fitness)
+
+        effective_mu = mu * (max(0, health + death_delta) / 100.0)
+        growth_delta = biomass * (np.exp(effective_mu * timestep) - 1)
+
+        return {'internal': {'biomass': growth_delta, 'cell_state': death_delta}}
+
+class MS2PhageProcess(Process):
+    def ports_schema(self):
+        return {
+            'infection_port': {'_default': 0.0},
+            'virion_count': {'_default': 0.0, '_updater': 'accumulate', '_emit': True},
+            'f_status': {'_default': 0, '_updater': 'set', '_emit': True},
+            'state': {'_default': 100.0, '_updater': 'accumulate', '_emit': True}, 
+            'exchange': {'_default': 0.0, '_updater': 'accumulate', '_emit': True}
+        }
+
+    def next_update(self, timestep, states):
+        phage_env = states['infection_port']
+        f_present = states['f_status']
+        health = states['state']
+        current_virions = states['virion_count']
+        
+        update = {}
+        if health <= 0:
+            if current_virions > 0 and current_virions < 1500:
+                return {'virion_count': -current_virions}
+            return {}
+        
+        k_decay = 1.5e-4
+        decay_amount = current_virions * (1 - np.exp(-k_decay * timestep))
+        if decay_amount > 0:
+            update['virion_count'] = -decay_amount
+
+        loss_rate_per_gen = 1e-4
+        gen_time = 20.0
+        lambda_loss = -np.log(1 - loss_rate_per_gen) / gen_time
+        prob_loss = 1 - np.exp(-lambda_loss * (1.0 + phage_env * 0.1) * timestep)
+        
+        if f_present:
+            if np.random.random() < prob_loss:
+                update['f_status'] = 0
+            
+            if current_virions < 1500: 
+                replication_rate = 0.5 * phage_env * timestep
+                update['virion_count'] = update.get('virion_count', 0) + replication_rate
+            else:
+                update['state'] = -health  
+                update['exchange'] = 1500.0  
+                
+        return update
+
+class EcoliSynergyAgent(Composer):
+    defaults = {'agent_id': 'ecoli_0', 'ms2': {}, 'ecoli': {}}
+    def generate_processes(self, config):
+        return {
+            'metabolism': GenEcoliProcess(config['ecoli']),
+            'ms2_crn': MS2PhageProcess(config['ms2']),
+        }
+    def generate_topology(self, config):
+        return {
+            'metabolism': {'internal': ('internal',), 'boundary': ('boundary',)},
+            'ms2_crn': {
+                'infection_port': ('..', '..', 'fields', 'phage'),
+                'virion_count': ('internal', 'virions'),
+                'f_status': ('internal', 'f_plasmid'),
+                'state': ('internal', 'cell_state'),
+                'exchange': ('boundary', 'phage_transfer')
+            }
+        }
+
+def run_experimental_condition(amp_concentration, initial_phage, is_f_plus, sim_time=240, seed=None, lhs_fitness=1.0):
+    if seed is not None: np.random.seed(seed)
+    composer = EcoliSynergyAgent({})
+    agent_bundle = composer.generate()
+    full_composite = {
+        'processes': {'agents': {'ecoli_0': agent_bundle['processes']}},
+        'topology': {'agents': {'ecoli_0': agent_bundle['topology']}},
+        'steps': {}, 'flow': {}, 'state': {}
+    }
+    initial_state = {
+        'fields': {'ampicillin': float(amp_concentration), 'phage': float(initial_phage)},
+        'agents': {
+            'ecoli_0': {
+                'internal': {
+                    'biomass': 1.0, 'f_plasmid': 1 if is_f_plus else 0,
+                    'cell_state': 100.0, 'virions': 0.0, 'base_fitness': lhs_fitness,
+                    'metabolites': {'atp': 100.0}
+                },
+                'boundary': {
+                    'location': [0.5, 0.5], 'phage_transfer': 0.0, 
+                    'lethality_port': float(amp_concentration)
+                }
+            }
+        }
+    }
+    sim = Engine(composite=full_composite, initial_state=initial_state)
+    sim.update(sim_time)
+    return sim.emitter.get_data()
+
+def run_monte_carlo(condition_params, N=100, sim_time=240):
+    all_trials_data = []
+    sampler = qmc.LatinHypercube(d=1, seed=42)
+    sample = sampler.random(n=N)
+    lhs_fitness_values = norm.ppf(sample, loc=1.0, scale=0.05).flatten()
+    for i in range(N):
+        data = run_experimental_condition(
+            amp_concentration=condition_params['amp'], 
+            initial_phage=condition_params['phage'], 
+            is_f_plus=condition_params['f_plus'],
+            sim_time=sim_time, seed=i, lhs_fitness=lhs_fitness_values[i] 
+        )
+        all_trials_data.append(data)
+    return all_trials_data
+
+if __name__ == '__main__':
+    experiments = {
+        "Growth Control (No Amp)":          {'amp': 0,           'phage': 0,  'f_plus': True},
+        "F plasmid Control ":               {'amp': 500,        'phage': 0,  'f_plus': False},
+        "Ampicillin Control (Amp only)":    {'amp': 500,        'phage': 0,  'f_plus': True},
+        "Phage Control (Phage, no F gene)": {'amp': 0,           'phage': 50, 'f_plus': False},
+        "Phage Control (Phage, f+)":        {'amp': 0,           'phage': 50, 'f_plus': True},
+        "Treatment: Low Amp (143.1 uM)":    {'amp': 143.098365, 'phage': 50, 'f_plus': True},
+        "Treatment: Mid Amp (286.2 uM)":    {'amp': 286.19673,  'phage': 50, 'f_plus': True},
+        "Treatment: High Amp (572.4 uM)":   {'amp': 572.39346,  'phage': 50, 'f_plus': True}
+    }
+
+    N_TRIALS = 100 
+    sim_duration = 240
+    all_results = {}
+    for name, params in experiments.items():
+        all_results[name] = run_monte_carlo(params, N=N_TRIALS, sim_time=sim_duration)
+
+    fig_graphs, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
+    colors = ['green', 'gray', 'red', 'blue', 'cyan', 'orange', 'purple', 'black']
+    table_data = []
+    row_labels = []
+    col_labels = ["T=60 min", "T=120 min", "T=180 min", "T=240 min"]
+    milestones = [60.0, 120.0, 180.0, 240.0]
+    csv_data = []
+    raw_csv_data = [] 
+
+    for (name, ensemble), color in zip(all_results.items(), colors):
+        times = sorted(list(ensemble[0].keys()))
+        mean_h, std_h = [], []  
+        mean_b, std_b = [], []   
+        mean_v, std_v = [], []     
+        mean_f, std_f = [], []    
+        for t in times:
+            h_at_t, b_at_t, v_at_t, f_at_t = [], [], [], []
+            for trial_idx, trial_data in enumerate(ensemble):
+                agent_data = trial_data[t]['agents'].get('ecoli_0')
+                if agent_data and 'internal' in agent_data:
+                    h_val = agent_data['internal']['cell_state']
+                    b_val = agent_data['internal']['biomass']
+                    v_val = agent_data['internal']['virions']
+                    f_val = agent_data['internal']['f_plasmid']
+                else:
+                    h_val, b_val, v_val, f_val = 0.0, 0.0, 0.0, 0.0
+                h_at_t.append(h_val)
+                b_at_t.append(b_val)
+                v_at_t.append(v_val)
+                f_at_t.append(f_val)
+                raw_csv_data.append({
+                    'Condition': name,
+                    'Trial': trial_idx,
+                    'Time (min)': t,
+                    'Health': h_val,
+                    'Biomass': b_val,
+                    'Virions': v_val,
+                    'F-Plasmid': f_val
+                })
+            mean_h.append(np.mean(h_at_t))
+            std_h.append(np.std(h_at_t))
+            mean_b.append(np.mean(b_at_t))
+            std_b.append(np.std(b_at_t))
+            mean_v.append(np.mean(v_at_t))
+            std_v.append(np.std(v_at_t))
+            mean_f.append(np.mean(f_at_t))
+            std_f.append(np.std(f_at_t))
+            csv_data.append({
+                'Condition': name,
+                'Time (min)': t,
+                'Mean Health': np.mean(h_at_t),
+                'Std Health': np.std(h_at_t),
+                'Mean Biomass': np.mean(b_at_t),
+                'Std Biomass': np.std(b_at_t),
+                'Mean Virions': np.mean(v_at_t),
+                'Std Virions': np.std(v_at_t),
+                'Mean F-Plasmid': np.mean(f_at_t),
+                'Std F-Plasmid': np.std(f_at_t)
+            })
+        mean_h, std_h = np.array(mean_h), np.array(std_h)
+        mean_b, std_b = np.array(mean_b), np.array(std_b)
+        mean_v, std_v = np.array(mean_v), np.array(std_v)
+        mean_f, std_f = np.array(mean_f), np.array(std_f)
+        for var_name, m_arr, s_arr in [("Health", mean_h, std_h), 
+                                       ("Biomass", mean_b, std_b), 
+                                       ("Virions", mean_v, std_v),
+                                       ("F-Plasmid", mean_f, std_f)]:
+            row_labels.append(f"{name} ({var_name})")
+            row_vals = []
+            for milestone in milestones:
+                idx = np.abs(np.array(times) - milestone).argmin()
+                if var_name == "F-Plasmid":
+                    row_vals.append(f"{m_arr[idx]:.2f} ± {s_arr[idx]:.2f}")
+                else:
+                    row_vals.append(f"{m_arr[idx]:.1f} ± {s_arr[idx]:.1f}")
+            table_data.append(row_vals)
+        ax1.plot(times, mean_h, label=name, color=color, linewidth=2)
+        ax1.fill_between(times, np.maximum(0, mean_h - std_h), np.minimum(100, mean_h + std_h), color=color, alpha=0.15)
+        ax2.plot(times, mean_b, label=name, color=color, linewidth=2)
+        ax2.fill_between(times, np.maximum(0, mean_b - std_b), mean_b + std_b, color=color, alpha=0.15)
+        ax3.plot(times, mean_v, label=name, color=color, linewidth=2)
+        ax3.fill_between(times, np.maximum(0, mean_v - std_v), mean_v + std_v, color=color, alpha=0.15)
+
+    ax1.set_title('Mean Cell Health (0 = Dead)', fontsize=12, fontweight='bold')
+    ax1.set_xlabel('Time (minutes)')
+    ax1.set_ylabel('Health %')
+    ax1.grid(True, linestyle='--', alpha=0.6)
+    ax2.set_title('Mean Biomass Accumulation', fontsize=12, fontweight='bold')
+    ax2.set_xlabel('Time (minutes)')
+    ax2.set_ylabel('Biomass Units')
+    ax2.grid(True, linestyle='--', alpha=0.6)
+    ax3.set_title('Internal Virion Count', fontsize=12, fontweight='bold')
+    ax3.set_xlabel('Time (minutes)')
+    ax3.set_ylabel('Total Virions')
+    ax3.grid(True, linestyle='--', alpha=0.6)
+
+    lines, labels = ax1.get_legend_handles_labels()
+    fig_graphs.legend(lines, labels, loc='lower center', bbox_to_anchor=(0.5, -0.05), ncol=4)
+    fig_graphs.tight_layout(rect=[0, 0.05, 1, 1])
+    plt.savefig('monte_carlo_graphs.png', dpi=300, bbox_inches='tight')
+
+    fig_table, ax_table = plt.subplots(figsize=(14, 10))
+    ax_table.axis('tight')
+    ax_table.axis('off')
+    mpl_table = ax_table.table(
+        cellText=table_data, 
+        rowLabels=row_labels, 
+        colLabels=col_labels, 
+        loc='center',
+        cellLoc='center'
+    )
+    mpl_table.auto_set_font_size(False)
+    mpl_table.set_fontsize(9)
+    mpl_table.scale(1.2, 1.3) 
+    plt.title('Monte Carlo Output: Mean ± Std Dev Over Time', fontsize=14, fontweight='bold', pad=20)
+    plt.savefig('monte_carlo_table.png', dpi=300, bbox_inches='tight')
+
+    pd.DataFrame(csv_data).to_csv('monte_carlo_full_data.csv', index=False)
+    pd.DataFrame(raw_csv_data).to_csv('monte_carlo_raw_data.csv', index=False)
+    plt.show()
+
+
