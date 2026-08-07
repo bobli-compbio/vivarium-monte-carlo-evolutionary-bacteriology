@@ -1,0 +1,25 @@
+Researcher: Bob Li
+Research Institution: The Gwinnett School of Mathematics, Science and Technology
+Architecture: Agent-based modeling, stochastic modeling
+Key Findings and Personal Focuses
+The MS2 bacteriophages eliminated the bacterial populations rapidly, reducing the ampicillin component to a secondary "clean-up" mechanism. This behavior demonstrates the E. coli population was kinetically overwhelmed and unable to release the F-plasmid in the alloted time.
+Large Focuses on Randomness & Biological Fidelity: A significant portion of development was dedicated to optimizing the stochastic parameters and parameter spaces of the system from actual in-vitro studies, and through confirmed mathematical processes.
+
+Mathematical & Statistical Frameworks
+The simulation engine deployed quantitative architecture, utilizing:
+a) Quasi-Monte Carlo (QMC) Simulation Pipelines
+b) Latin Hypercube Sampling (LHS)
+c) Inverse Normal Cumulative Distribution Function (norm.ppf) 
+d) Factorial Analysis of Variance (Factorial ANOVA) 
+e) Bliss Independence Synergy Matrix Modeling 
+f) Non-Linear Hill Equations & Michaelis-Menten Pharmacodynamics
+g) First-Order Kinetic Decay Rate Constants 
+
+Software & Compute Stack
+Vivarium Engine Core and integrated process/topology network modules
+Anaconda Distribution via Jupyter Notebook environments 
+Python 3 utilizing SciPy, Numpy, Matplotlib, and PANDAS
+
+Limitations and Personal Opinions:
+Thought was not given into bacteriophage resistance considering the easier evolutionary tradeoff of simply release F-plasmids, though it is true that the ampicillin selected for not the lost of F-plasmids but simply the evolution or change in the structure of previously existing F plasmids, though the pili likely would not have been lost
+In vitro testing was limited due to regulations at the institute where research woudl have been performed, specifically regarding the usage of bacteriophages and available funding, as funding was set upon the researchers rather than the school.
